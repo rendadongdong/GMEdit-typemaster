@@ -1,0 +1,6 @@
+{
+	"name": "gm-typemaster",
+	"description": "Automatic type inference for GML (struct fields / function return types), middle-click go-to-definition for user code, and event members in the outline view.",
+	"scripts": ["analyzer.js", "main.js"],
+	"stylesheets": ["styles.css"]
+}

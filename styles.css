@@ -1,0 +1,24 @@
+/* gm-typemaster / outline view: glyphs for the members listed inside an event.
+   Items are marked with `outline-data="tm_fn"` / `"tm_var"` by main.js; the stock
+   outline-view CSS would otherwise draw its event sprite there. */
+#outline-view .outline-item[outline-data="tm_fn"] > .header:before,
+#outline-view .outline-item[outline-data="tm_var"] > .header:before {
+	background: none !important;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	font-family: "Segoe UI Symbol", "Segoe UI", system-ui, sans-serif;
+	font-weight: 600;
+	line-height: 1;
+	opacity: 0.8;
+}
+
+#outline-view .outline-item[outline-data="tm_fn"] > .header:before {
+	content: "ƒ";
+	font-size: 12px;
+}
+
+#outline-view .outline-item[outline-data="tm_var"] > .header:before {
+	content: "▪";
+	font-size: 10px;
+}
