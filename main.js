@@ -1190,11 +1190,13 @@
 	}
 
 	// Same walk as the original `update`, but aware of flush-left members and variables, so
-	// the "you are here" highlight lands on them too.
+	// the "you are here" highlight lands on them too. When the split view owns the focus,
+	// the caret and the document come from the aside pane instead of `file.codeEditor`.
 	function updateGml(file, pos) {
-		var def = pos.def, row = pos.row;
+		var pane = paneDocRow(file);
+		var doc = pane != null ? pane.doc : file.codeEditor.session.doc;
+		var def = pos.def, row = pane != null ? pane.row : pos.row;
 		var ctxName = null, ctxRow = null;
-		var doc = file.codeEditor.session.doc;
 		for (; row >= 0; row--) {
 			var text = doc.getLine(row), mt;
 			if ((mt = rxOvDef.exec(text)) != null) { def = mt[3]; break; }
@@ -1258,6 +1260,278 @@
 			catch (e) { log("outline update failed, falling back:", e); return origUpdate.apply(this, arguments); }
 		};
 		log("outline view extended: event members are listed");
+	}
+
+	// ---- split view (`show-aside`): follow the pane that owns the focus ------------
+	// The built-in `show-aside` plugin builds a *second* Ace instance over a clone of the
+	// file's session. `GmlFile.current` keeps pointing at the left tab, so `outline-view`
+	// always mirrors the left pane. When the aside pane owns the focus we hand the outline
+	// a stand-in file whose `codeEditor` is the aside editor: `changeTo` then reindexes the
+	// right document, and the update path reads the right caret.
+	var ASIDE_EDITOR = null;
+	var ASIDE_FILE = null;        // stand-in GmlFile for the aside pane
+	var ASIDE_ACTIVE = false;
+	var ASIDE_DIRTY = false;
+	var ASIDE_REUSED = false;   // the aside shows the same file: its tree is reused
+	var ASIDE_WATCH = null;
+
+	function asideContainer() {
+		var el = document.getElementById("aside_editor");
+		return el == null ? null : el;
+	}
+
+	function findAsideEditor() {
+		var box = asideContainer();
+		if (box == null) return null;
+		var el = box.querySelector(".ace_editor");
+		if (el != null && el.aceEditor != null) return el.aceEditor;
+		if (box.aceEditor != null) return box.aceEditor;
+		return null;
+	}
+
+	function outlineTree() {
+		return document.querySelector("#outline-view .treeview");
+	}
+
+	// `aceEditor` is a global in GMEdit's own script; fall back to the window property in
+	// case that ever changes.
+	function mainEditor() {
+		try {
+			if (typeof aceEditor !== "undefined" && aceEditor != null) return aceEditor;
+		} catch (e) { /* ignore */ }
+		return window.aceEditor || null;
+	}
+
+	function escapeRxText(s) {
+		return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	}
+
+	// Find the row a nav entry points at *without* touching the main editor - the native
+	// `kind.navigate` hard-codes `Main.aceEditor`, which would drag the left pane along.
+	function navRowIn(session, nav) {
+		var len = session.getLength(), row = -1, i;
+		if (nav.def != null) {
+			var d = escapeRxText(nav.def);
+			var rxDef = new RegExp("^[ \\t]*(?:(?:#event|#define|#moment|#section|#roomcc)[ \\t]+)?" +
+				d + "\\b|^[ \\t]*function[ \\t]+" + d + "\\b");
+			for (i = 0; i < len; i++) {
+				if (rxDef.test(session.getLine(i))) { row = i; break; }
+			}
+		}
+		if (nav.ctx != null) {
+			var test;
+			if (nav.ctxRx instanceof RegExp) {
+				var rx = nav.ctxRx;
+				test = function (s) { rx.lastIndex = 0; return rx.test(s); };
+			} else {
+				var needle = String(nav.ctx);
+				test = function (s) { return s.indexOf(needle) >= 0; };
+			}
+			var start = row >= 0 ? row : 0;
+			for (i = start; i < len; i++) {
+				if (i === row) continue;             // the def line itself is not the target
+				if (test(session.getLine(i))) { row = i; break; }
+			}
+		}
+		return row;
+	}
+
+	function navigateAside(editor, nav) {
+		try {
+			var row = navRowIn(editor.session, nav);
+			if (row < 0) return false;
+			if (nav.showAtTop !== false) editor.scrollToLine(row);
+			editor.gotoLine(row + 1, 0);
+			editor.focus();
+			return true;
+		} catch (e) { log("aside navigate failed:", e); return false; }
+	}
+
+	function pluginSignal(name, data) {
+		var PA = G("plugins.PluginAPI");
+		if (PA == null || typeof PA._signal !== "function") return false;
+		try { PA._signal(name, data); return true; }
+		catch (e) { log("signal '" + name + "' failed:", e); return false; }
+	}
+
+	function asideFileFor(editor) {
+		var base = editor && editor.session ? editor.session.gmlFile : null;
+		if (base == null) return null;
+		if (ASIDE_FILE != null && ASIDE_FILE.__tmBase === base && ASIDE_FILE.codeEditor === editor) {
+			return ASIDE_FILE;
+		}
+		if (ASIDE_FILE != null && ASIDE_FILE.outlineView != null) {
+			var old = ASIDE_FILE.outlineView;
+			if (old.parentElement != null) old.parentElement.removeChild(old);
+		}
+		// Prototype-chained on purpose: anything we do not override (kind, save, path, ...)
+		// keeps working, only the editor and the label differ.
+		var p = Object.create(base);
+		p.__tmAside = true;
+		p.__tmBase = base;
+		p.name = (base.name || "file") + " (aside)";
+		p.codeEditor = editor;
+		p.tabEl = null;                    // `activateFile` must not click the left tab
+		p.outlineView = null;
+		p.navigate = function (nav) { return navigateAside(editor, nav); };
+		ASIDE_FILE = p;
+		return p;
+	}
+
+	function markOutlineCurrent(node) {
+		var tv = outlineTree();
+		if (node == null || tv == null) return;
+		if (node.parentElement !== tv) tv.appendChild(node);
+		node.classList.add("open");
+		var curr = tv.querySelectorAll(".outline-current-file");
+		for (var i = 0; i < curr.length; i++) {
+			if (curr[i] !== node) curr[i].classList.remove("outline-current-file");
+		}
+		node.classList.add("outline-current-file");
+	}
+
+	function ensurePinned() {
+		if (!ASIDE_ACTIVE || ASIDE_FILE == null) return;
+		markOutlineCurrent(ASIDE_FILE.outlineView);
+	}
+
+	function pinAside() {
+		var ed = findAsideEditor();
+		if (ed == null) return;
+		var proxy = asideFileFor(ed);
+		if (proxy == null) return;
+
+		// `show-aside` always starts from the active file, so the usual case is "both panes
+		// show the same document". Its tree is already in the sidebar and its content is
+		// identical - building a second, near-identical tree would just be noise, so we only
+		// move the "current" marker there; the highlight still follows the right pane because
+		// updateGml reads the aside caret.
+		var cur = null;
+		try { cur = G("gml.file.GmlFile").current; } catch (e) { /* ignore */ }
+		if (cur != null && proxy.__tmBase === cur && cur.outlineView != null) {
+			ASIDE_REUSED = true;
+			if (ASIDE_FILE.outlineView != null) {
+				var stale = ASIDE_FILE.outlineView;
+				stale.classList.remove("outline-current-file");
+				if (stale.parentElement != null) stale.parentElement.removeChild(stale);
+				ASIDE_FILE.outlineView = null;
+			}
+			markOutlineCurrent(cur.outlineView);
+			return;
+		}
+
+		ASIDE_REUSED = false;
+		if (ASIDE_DIRTY) {
+			var old = proxy.outlineView;
+			if (old != null && old.parentElement != null) old.parentElement.removeChild(old);
+			proxy.outlineView = null;
+			ASIDE_DIRTY = false;
+		}
+		pluginSignal("activeFileChange", { file: proxy });
+		ensurePinned();
+	}
+
+	function unpinAside() {
+		ASIDE_ACTIVE = false;
+		if (!ASIDE_REUSED) {
+			// only the stand-in tree needs the real file put back in charge
+			var cur = null;
+			try { cur = G("gml.file.GmlFile").current; } catch (e) { /* ignore */ }
+			if (cur != null) pluginSignal("activeFileChange", { file: cur });
+		}
+		ASIDE_REUSED = false;
+		if (ASIDE_FILE != null && ASIDE_FILE.outlineView != null) {
+			var node = ASIDE_FILE.outlineView;
+			node.classList.remove("outline-current-file");
+			if (node.parentElement != null) node.parentElement.removeChild(node);
+		}
+	}
+
+	function syncAsideFocus() {
+		if (!enabled || !OV_HOOKED) return;
+		var ed = findAsideEditor();
+		if (ed == null) {
+			if (ASIDE_ACTIVE) unpinAside();
+			ASIDE_EDITOR = null;
+			return;
+		}
+		if (ASIDE_EDITOR !== ed) hookAsideEditor(ed);
+		var box = asideContainer();
+		var act = document.activeElement;
+		var active = box != null && act != null && box.contains(act);
+		if (active === ASIDE_ACTIVE) {
+			if (active) ensurePinned();
+			return;
+		}
+		ASIDE_ACTIVE = active;
+		if (active) pinAside();
+		else unpinAside();
+	}
+
+	function hookAsideEditor(ed) {
+		ASIDE_EDITOR = ed;
+		if (ed == null || ed.__tmAsideHooked) return;
+		ed.__tmAsideHooked = true;
+		try {
+			ed.on("focus", function () {
+				ASIDE_ACTIVE = false;                 // force a re-pin through the same path
+				window.setTimeout(syncAsideFocus, 0);
+			});
+			ed.on("changeSelection", function () {
+				if (!enabled || !ASIDE_ACTIVE) return;
+				// `outline-view` only listens on the main editor. Nudging it makes the
+				// "you are here" highlight follow this pane; updateGml then reads the
+				// aside document instead of the left one.
+				try {
+					var main = mainEditor();
+					if (main != null && typeof main._emit === "function") main._emit("changeSelection");
+				} catch (e) { /* ignore */ }
+			});
+			ed.on("changeSession", function (e) {
+				ASIDE_DIRTY = true;
+				var s = e && e.session;
+				if (s != null && typeof s.on === "function") {
+					s.on("change", function () { ASIDE_DIRTY = true; });
+				}
+				window.setTimeout(syncAsideFocus, 0);
+			});
+		} catch (e) { log("aside hook failed:", e); }
+		try {
+			if (ed.session != null && typeof ed.session.on === "function") {
+				ed.session.on("change", function () { ASIDE_DIRTY = true; });
+			}
+		} catch (e) { /* ignore */ }
+		log("aside pane hooked: the outline follows the focused pane");
+	}
+
+	function watchAside() {
+		if (ASIDE_WATCH != null) return;
+		ASIDE_WATCH = window.setInterval(syncAsideFocus, 700);
+		try {
+			var main = mainEditor();
+			if (main != null && typeof main.on === "function") {
+				main.on("focus", function () {
+					if (ASIDE_ACTIVE) unpinAside();
+				});
+			}
+		} catch (e) { /* ignore */ }
+	}
+
+	// Which document/row should the outline read? Normally the file's own editor, but the
+	// aside pane wins while it owns the focus (its session is a clone, so `file.codeEditor`
+	// would walk the left pane's caret).
+	function paneDocRow(file) {
+		if (file != null && file.__tmAside) {
+			var s1 = file.codeEditor != null ? file.codeEditor.session : null;
+			if (s1 != null) return { doc: s1.doc, row: s1.selection.lead.row };
+		}
+		if (ASIDE_ACTIVE) {
+			var ed = findAsideEditor();
+			if (ed != null && ed.session != null) {
+				return { doc: ed.session.doc, row: ed.session.selection.lead.row };
+			}
+		}
+		return null;
 	}
 
 	function install(editor) {
@@ -1380,6 +1654,13 @@
 		out.definitions = Object.keys(DEFS).length;
 		out.definitionSites = DEFS_COUNT;
 		out.outlineExtended = OV_HOOKED;
+		out.aside = {
+			detected: ASIDE_EDITOR != null,
+			focused: ASIDE_ACTIVE,
+			file: ASIDE_FILE != null ? ASIDE_FILE.name : null,
+			dirty: ASIDE_DIRTY,
+			reusedTree: ASIDE_REUSED
+		};
 		try {
 			var ed = currentEditor();
 			if (ed == null) { out.editor = "none"; log("dump", out); return out; }
@@ -1507,6 +1788,7 @@
 				["middle-click", hookMiddleClick],
 				["open-declaration", hookOpenDeclaration],
 				["outline", hookOutlineView],
+				["split-view", watchAside],
 				["existing-editors", installExisting]
 			];
 			for (var si = 0; si < steps.length; si++) {

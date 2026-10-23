@@ -119,6 +119,19 @@
    - `#region` / `//#mark` 的折叠层级保持原样。
    - 选项沿用 outline-view 自己的「显示函数参数」「滚动到顶部」，没有新增开关。
    - 代价：只有打开的标签页会被重新扫描，平均 0.6ms/文件（1.8 万行的大文件约 28ms）。
+   - **分屏（右键 → Show aside）时，导航栏跟随当前聚焦的那一侧。**
+     内置 outline 只认 `GmlFile.current`（永远是左边那个标签页），而 `show-aside` 是在
+     文件的 session **克隆**上另建一个 Ace 实例，所以右侧换了文件、滚到别处，导航栏都毫无反应。
+     插件给右侧面板准备了一个"替身文件"：原型就是真正的 `GmlFile`（`kind`、`path`、
+     保存等照旧可用），只把 `codeEditor` 换成右侧的编辑器、`tabEl` 置空、`navigate` 换成
+     只作用于右侧面板的定位。
+     右侧一获得焦点，导航栏就切到那一份内容、高亮跟着右侧光标走；
+     点导航条目只滚动右侧，不会把左边一起拖走。
+     左侧重新聚焦时自动还原。
+     若右侧显示的就是当前文件（`show-aside` 默认如此），两棵树内容完全一样，
+     插件不会在导航栏里造第二棵重复的树，只把"当前"标记移过去，高亮仍按右侧光标算；
+     只有左右打开的是**不同文件**时，才会多出一棵名字带 ` (aside)` 的树。
+     焦点探测来自 `#aside_editor` 里实际获得焦点的元素，700ms 轮询 + `focus` 事件双保险。
 
 7. **`global.NAME` 的结构体字段**
    GMEdit 会解析出「有哪些全局变量」（输入 `global.` 能列出来），但**从不记录它们的值长什么样**，
@@ -253,6 +266,32 @@ GMEdit 只会在写了 `/// @is` 的全局上填这张表，所以插件把自�
 因此不会让 `$tm.1` 出现在普通命名空间补全里。镜像按分析代次（generation）缓存，
 并且当 GMEdit 重新解析、替换了 import 对象或清空命名空间表时会自动重建。
 
+### 分屏为什么能跟随（以及为什么不能直接改 `GmlFile.current`）
+
+`outline-view` 内部取"当前文件"只有一条路：`currFile()` → `gml.file.GmlFile.current`。
+`show-aside` 建第二个 Ace 实例时用的是 `aceTools.cloneSession(file.codeEditor.session)`，
+克隆 session 上挂的 `gmlFile` 仍是**同一个** `GmlFile`，所以：
+
+- 右侧的 session 是独立的（滚动、光标各走各的），但"这是哪个文件"没有第二份登记；
+- 于是导航栏永远解析左边那份。
+
+诱人但危险的做法是把 `GmlFile.current` 劫持成右侧的替身——保存、lint、标签高亮、`checkChanges`
+都会跟着读到替身，容易出错。插件用的是另一条路：
+
+1. 做一个 `Object.create(真file)` 的替身，只覆盖 `codeEditor` / `name` / `tabEl` / `navigate`；
+2. 右侧拿到焦点时，通过 `plugins.PluginAPI._signal("activeFileChange", { file: 替身 })`
+   触发 outline 自己的 `changeTo` → `createFor` → `reindex`，走的还是**同一套**解析代码
+   （`_modeMap["ace/mode/gml"]` 已经被本插件接管），只是 `file.codeEditor` 换成了右侧的；
+3. `displayMode` 不是"只显示当前文档"时，outline 的 `syncAll` 不会把替身放进树里，
+   插件再把它手动挂回 `#outline-view .treeview` 并打上 `outline-current-file`；
+   若右侧就是当前文件，则跳过 1–3：两棵树长得一模一样，复用左边那棵，只移动当前标记；
+4. 高亮跟随：outline 只监听主编辑器的 `changeSelection`，所以右侧改选时插件对主编辑器
+   `_emit("changeSelection")` 空推一次，`updateGml` 里再用 `paneDocRow()` 换成右侧的
+   doc 与光标行——`pos.def` / `pos.ctx` 算的是右侧的位置，DOM 里查的却是当前高亮的那棵树，
+   两边正好对上；
+5. 点条目不能走原生 `kind.navigate`——它内部硬编码 `Main.aceEditor.gotoLine`，会把左边拖走。
+   替身的 `navigate` 自己按 `nav.def` / `nav.ctx(Rx)` 找行，只在右侧 `gotoLine`。
+
 ### 为什么不会出现重复条目
 
 `smartCompleter` 和 `smartAltCompleter` 都注册在 `editor.completers` 里，都是 `dotKind = 5`，
@@ -281,6 +320,11 @@ alt 仍保留备份作用——只有主补全器完全没结果时它才会发�
   （为 0 说明事件名表没加载，对象事件会索引不到）、以及某个名字是否命中、是否被当成引擎内置。
 - `outline view extended: event members are listed` —— 大纲解析已接管（只在启动时打一次）。
   没有这行说明 `outline-view` 插件没启用，或者它比本插件加载得更晚（插件会重试约 8 秒）。
+- `aside pane hooked: the outline follows the focused pane` —— 第一次检测到分屏（Show aside）
+  面板时打一次。之后用 `__typeMaster.dump()` 里的 `aside` 字段看状态：
+  `detected`（有没有分屏）、`focused`（焦点是否在右侧）、`file`（右侧显示的文件）、`dirty`（内容改过、下次聚焦会重建）。
+- `signal 'activeFileChange' failed:` —— 通知 outline 切换文件时出错，导航栏不会跟随右侧。
+- `aside navigate failed:` —— 点导航条目时在右侧定位失败（不会影响左侧）。
 - `outline reindex failed, falling back:` —— 接管版本报错，已自动退回原版行为，把日志发我。
 - `project index: N file(s), M function(s)..., G global(s)..., K symbol(s) with a location...` —— 索引规模，
   `G` 为 0 说明工程里没有 `global.X = ...` 形式的定义，`K` 为 0 说明定义扫描没跑。
