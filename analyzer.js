@@ -13,6 +13,22 @@ var TypeMasterAnalyzer = (function () {
 		"and or not xor mod div true false undefined self other all noone global " +
 		"begin end then else").split(" ").forEach(function (k) { if (k) KEYWORDS[k] = true; });
 
+	// Built-in instance variables. A struct or a constructor is allowed to use these names
+	// (`pos = { x : 0 }` is everywhere), but they must never be registered under their *bare*
+	// name: the fallback lookup would then caption every unrelated `something.x` in the
+	// project with whatever sentence the first annotated struct wrote for it.
+	var BUILTIN_VARS = Object.create(null);
+	("x y xstart ystart xprevious yprevious hspeed vspeed speed direction gravity " +
+		"gravity_direction friction depth id object_index persistent solid visible " +
+		"sprite_index sprite_width sprite_height sprite_xoffset sprite_yoffset " +
+		"image_index image_speed image_xscale image_yscale image_angle image_alpha " +
+		"image_blend image_number image_single mask_index name layer " +
+		"bbox_left bbox_right bbox_top bbox_bottom " +
+		"path_index path_position path_positionprevious path_speed path_scale " +
+		"path_orientation path_endaction " +
+		"timeline_index timeline_position timeline_speed timeline_running timeline_loop " +
+		"alarm").split(" ").forEach(function (k) { if (k) BUILTIN_VARS[k] = true; });
+
 	// GameMaker functions that hand back an instance id, mapped to the argument
 	// that tells us which object it is. Index is 0-based.
 	var INSTANCE_CALLS = Object.create(null);
@@ -68,6 +84,16 @@ var TypeMasterAnalyzer = (function () {
 			}
 		}
 		return out.join("");
+	}
+
+	// The name a reader would recognise for a struct field. A synthesized struct (`{st: n}`)
+	// has no name of its own - printing `$tm.7` in a tooltip helps nobody - so it is null.
+	function fieldTypeName(t) {
+		if (t == null) return null;
+		if (t.st != null) return null;
+		if (t.obj != null) return t.obj;
+		if (t.nm != null) return t.nm;
+		return null;
 	}
 
 	function matchClose(s, i) {
@@ -137,27 +163,52 @@ var TypeMasterAnalyzer = (function () {
 		// ---- explicit `/// @is {type}` hints -----------------------------
 		// GMEdit's own @is only covers struct/instance/global fields. We honour it for local
 		// variables too: same line (`var x = ...; /// @is {T}`) or the line right above.
+		//
+		// The text around the braces is a description, and it may sit on either side:
+		//   /// @is {obj_item_parent} 父物品的实例
+		//   /// @is 父物品的实例 {obj_item_parent}
+		//   /// @is 只是一个说明                       (no type at all - prose only)
+		// `main.js` keeps it next to the hover tooltip of that variable.
 		var lineHints = Object.create(null);
+		var lineHintDocs = Object.create(null);
 		var textLines = text.split("\n");
-		var reIs = /\/\/\/\s*@is\s*\{([^}]+)\}/;
+		// `[^\r\n]*` rather than `.*$`: game projects are full of CRLF files, and `.` does
+		// not match `\r` while `$` only anchors at the very end - the pattern would silently
+		// never match a single Windows line.
+		// `//` as well as `///`: GMEdit only understands the triple-slash form, so the
+		// plugin has no reason to insist on it - and `//@is` is what people actually type.
+		var reIs = /\/\/+\s*@is\b([^\r\n]*)/;
 		var hintRows = [];
 		for (var hli = 0; hli < textLines.length; hli++) {
 			var hm = reIs.exec(textLines[hli]);
 			if (hm == null) continue;
-			var hintName = hm[1].replace(/<.*$/, "").trim();
-			if (!hintName || !isIdStart(hintName.charAt(0))) continue;
-			lineHints[hli] = hintName;
+			var isRest = hm[1] || "";
+			var isType = /\{([^}]*)\}/.exec(isRest);
+			var isDesc = isRest.replace(/\{[^}]*\}/g, " ").replace(/\s+/g, " ").trim();
+			if (isDesc !== "") lineHintDocs[hli] = isDesc;
+			var hintName = isType != null ? isType[1].replace(/<.*$/, "").trim() : "";
 			// Only a comment standing on its own line carries over to the next line.
 			// A trailing `var x = y; /// @is {T}` describes that statement only.
-			if (textLines[hli].slice(0, hm.index).trim() === "") hintRows.push(hli);
+			var onOwnLine = textLines[hli].slice(0, hm.index).trim() === "";
+			if (!hintName || !isIdStart(hintName.charAt(0))) {
+				// Prose-only `/// @is ...` annotates no type, but the sentence was clearly
+				// written for the line below, so still hand it down.
+				if (isDesc !== "" && onOwnLine) hintRows.push(hli);
+				continue;
+			}
+			lineHints[hli] = hintName;
+			if (onOwnLine) hintRows.push(hli);
 		}
 		// A hint on its own line applies to the next line, unless that line has its own hint.
 		for (var hk = 0; hk < hintRows.length; hk++) {
 			var hrow = hintRows[hk];
 			var next = hrow + 1;
-			if (next >= textLines.length || lineHints[next] != null) continue;
+			if (next >= textLines.length) continue;
 			if (textLines[next].trim() === "") continue;
-			lineHints[next] = lineHints[hrow];
+			if (lineHints[hrow] != null && lineHints[next] == null) lineHints[next] = lineHints[hrow];
+			if (lineHintDocs[hrow] != null && lineHintDocs[next] == null) {
+				lineHintDocs[next] = lineHintDocs[hrow];
+			}
 		}
 
 		// ---- state ------------------------------------------------------
@@ -367,6 +418,141 @@ var TypeMasterAnalyzer = (function () {
 			return null;
 		}
 
+		// ---- `///@param {Type} name` -------------------------------------
+		// GMEdit parses @param itself (`parsers_seeker_GmlSeekerJSDocRegex.jsDoc_param`,
+		// same three spellings: @arg / @param / @argument, `{Type}` or `[Type]`, `a,b` on
+		// one line), but it only uses the result for the script's argument list - the
+		// call-site hints and the `#args` doc. Nothing ever lands in the function's own
+		// scope, so inside the body `_item.` completes nothing even though the type is
+		// written right above. Treat the annotation as what it is - a declaration - and
+		// feed it to the same table `/// @is` already writes to.
+		var paramVars = [];
+		var reParamDoc = /^\/\/\/\s*@(?:arg|param|argument)\s+(?:\{([^}]*)\}|\[([^\]]*)\])\s*(.*)$/;
+		var reParamNames = /^[\[(]?\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)/;
+
+		function paramTypeOf(raw) {
+			var tn = String(raw == null ? "" : raw).replace(/\s+/g, "");
+			if (tn === "") return null;
+			if (/\[\]$/.test(tn)) tn = "array";        // `obj_x[]` - an array, not the element
+			else tn = tn.replace(/<.*$/, "");          // `Array<T>` -> `Array`
+			if (tn === "" || !isIdStart(tn.charAt(0))) return null;
+			// Dotted names are GMEdit's/Feather's fully qualified spellings -
+			// `Id.Instance.obj_item_parent`, `Asset.GMObject.obj_x`. There is no namespace
+			// under that whole name, so the last segment is what has to be resolved.
+			if (tn.indexOf(".") >= 0) {
+				var tail = tn.slice(tn.lastIndexOf(".") + 1);
+				if (isObjectName(tail)) return { obj: tail, ex: true };
+				return { nm: tn, ex: true };
+			}
+			// A known object name becomes a real object type; that is what makes `applyTo`
+			// mirror the object's instance-variable namespace into this scope's imports.
+			if (isObjectName(tn)) return { obj: tn, ex: true };
+			return { nm: tn, ex: true };
+		}
+
+		// The `///` block sitting directly above a declaration - blanks allowed, anything
+		// else stops the scan. That way a doc block can never leak onto the function after
+		// the one it describes.
+		function paramDocsAbove(row) {
+			var out = Object.create(null);
+			var r = row - 1;
+			while (r >= 0 && textLines[r].trim() === "") r--;
+			while (r >= 0) {
+				var t = textLines[r].trim();
+				if (t.slice(0, 3) !== "///") break;
+				var pm = reParamDoc.exec(t);
+				if (pm != null) {
+					var ty = paramTypeOf(pm[1] != null ? pm[1] : pm[2]);
+					if (ty != null) {
+						var list = reParamNames.exec(pm[3] || "");
+						if (list != null) {
+							var arr = list[1].split(/\s*,\s*/);
+							for (var pi = 0; pi < arr.length; pi++) {
+								if (arr[pi] !== "" && out[arr[pi]] == null) out[arr[pi]] = ty;
+							}
+						}
+					}
+				}
+				r--;
+			}
+			return out;
+		}
+
+		// ---- `///@desc` / free `///` text: the human description ---------
+		// GMEdit has no `@desc` handling at all (`jsDoc_anyTag` matches it and the line
+		// falls through to the "append to the completion doc" branch), and its function
+		// signature - the one the hover tooltip and the status bar print - is built from
+		// `pre + args + post`. So the text was written but never shown where it matters.
+		// Collect it here and let main.js bolt it onto those two places.
+		var docsOut = Object.create(null);
+		var reDescTag = /^@(?:desc|description)\b\s*([\s\S]*)$/i;
+
+		function docTextAbove(row) {
+			var block = [];
+			var r = row - 1;
+			while (r >= 0 && textLines[r].trim() === "") r--;
+			while (r >= 0) {
+				var t = textLines[r].trim();
+				if (t.slice(0, 3) !== "///") break;
+				block.unshift(t.slice(3).trim());
+				r--;
+			}
+			if (block.length === 0) return null;
+			// An explicit `@desc` wins over loose `///` prose - a block usually has one or
+			// the other, and mixing both would print the same sentence twice.
+			var hasTag = false;
+			for (var bi = 0; bi < block.length; bi++) {
+				if (reDescTag.test(block[bi])) { hasTag = true; break; }
+			}
+			var parts = [];
+			for (var bj = 0; bj < block.length; bj++) {
+				var s = block[bj];
+				var md = reDescTag.exec(s);
+				if (md != null) {
+					if (md[1].trim() !== "") parts.push(md[1].trim());
+					continue;
+				}
+				if (!hasTag && s !== "" && !/^@\w+/.test(s)) parts.push(s);
+			}
+			var txt = parts.join(" ").replace(/\s+/g, " ").trim();
+			return txt === "" ? null : txt;
+		}
+
+		// Only names that really are parameters of *this* function survive: an annotation
+		// left over from the function above must not mistype a local that happens to share
+		// the name. The entry is parked on the body's opening row, which is inside the
+		// function's `gmlScopes` range, so `applyTo` writes it into that scope's imports.
+		function addParamTypes(lp, body) {
+			var docs = paramDocsAbove(rowOf(lp));
+			var has = false;
+			for (var dk in docs) { if (docs[dk] != null) { has = true; break; } }
+			if (!has) return;
+			var rp = matchClose(masked, lp);
+			if (rp < 0) return;
+			// A `function f(): T` declaration has no body to speak of (GMEdit owns that
+			// form), but the declaration row is inside the function's scope as well.
+			var row = body != null ? rowOf(body.b) : rowOf(lp);
+			var seg = lp + 1, dP = 0, dB = 0;
+			for (var k = lp + 1; k <= rp; k++) {
+				var c = masked.charAt(k);
+				if (k === rp || (c === "," && dP === 0 && dB === 0)) {
+					var st = skipSpace(seg, k);
+					// `...rest` / `[a, b]` / `a = 1` - only the bare name matters here
+					while (st < k && ".[(".indexOf(masked.charAt(st)) >= 0) st++;
+					var w = readWord(st, k);
+					if (w != null && docs[w.word] != null) {
+						paramVars.push({ row: row, name: w.word, type: docs[w.word] });
+					}
+					seg = k + 1;
+					continue;
+				}
+				if (c === "(") dP++;
+				else if (c === ")") dP--;
+				else if (c === "[") dB++;
+				else if (c === "]") dB--;
+			}
+		}
+
 		// Given the position of a function's `(`, return the range of its body braces.
 		function fnBody(lp) {
 			var rp = matchClose(masked, lp);
@@ -381,9 +567,15 @@ var TypeMasterAnalyzer = (function () {
 
 		function addFunction(name, lp) {
 			var body = fnBody(lp);
-			if (body == null) return;
-			var r = findFirstReturn(body.b + 1, body.e);
-			if (r != null) retRanges.push({ fn: name, s: r.s, e: r.e });
+			if (body != null) {
+				var r = findFirstReturn(body.b + 1, body.e);
+				if (r != null) retRanges.push({ fn: name, s: r.s, e: r.e });
+			}
+			addParamTypes(lp, body);
+			if (docsOut[name] == null) {
+				var dt = docTextAbove(rowOf(lp));
+				if (dt != null) docsOut[name] = dt;
+			}
 		}
 
 		var m;
@@ -435,7 +627,16 @@ var TypeMasterAnalyzer = (function () {
 			var rhsStart = skipSpace(j + 1, n);   // `x =` + newline + `{ ... }` is common GML
 			var rhsEnd = scanExprEnd(rhsStart);
 			var arow = rowOf(start);
-			rawAssigns.push({ name: word, s: rhsStart, e: rhsEnd, row: arow, hint: lineHints[arow] || null });
+			// `var hp = 10; //生命值` - a plain trailing comment counts too, exactly like a
+			// struct field or a constructor member. The sentence is keyed by scope, so it
+			// only ever shows for *this* variable in *this* function.
+			var adesc = lineHintDocs[arow] != null ? lineHintDocs[arow] : null;
+			if (adesc == null) {
+				var atrail = trailingDesc(rhsStart);
+				if (atrail != null) adesc = atrail.d;
+			}
+			rawAssigns.push({ name: word, s: rhsStart, e: rhsEnd, row: arow,
+				hint: lineHints[arow] || null, desc: adesc });
 			// `x = function () { ... }` swallows its whole body as one expression, so jumping
 			// to `rhsEnd` would skip every statement inside it. Event code in GMEdit is almost
 			// always written that way (`L_release_func = function () { ... }`), so keep
@@ -510,6 +711,12 @@ var TypeMasterAnalyzer = (function () {
 		}
 
 		// ---- 3. resolve (a few passes so chains settle) ------------------
+		// Declared parameter types go in first so that `var u = _item;` can pick them up,
+		// and are re-asserted afterwards: an assignment inside the body must not be able to
+		// talk us out of an annotation the user wrote by hand.
+		for (var pv0 = 0; pv0 < paramVars.length; pv0++) {
+			localTypes[paramVars[pv0].name] = paramVars[pv0].type;
+		}
 		for (var pass = 0; pass < 4; pass++) {
 			for (var ri = 0; ri < retRanges.length; ri++) {
 				var t = returnTypeOf(retRanges[ri]);
@@ -527,11 +734,15 @@ var TypeMasterAnalyzer = (function () {
 		for (var vi = 0; vi < rawAssigns.length; vi++) {
 			var v = rawAssigns[vi];
 			var vt = v.hint ? { nm: v.hint, ex: true } : typeOf(v.s, v.e);
-			if (!vt) continue;
+			// An unknown type used to drop the entry outright. That is the right call for
+			// completion, but it also threw the sentence away: `obj_name = _object_name; //str`
+			// has nothing to infer from (`_object_name` is an untyped parameter), yet the
+			// caption is still exactly what the author wants to see on hover.
+			if (!vt && v.desc == null) continue;
 			var key = v.row + "|" + v.name;
 			if (seen[key]) continue;
 			seen[key] = true;
-			vars.push({ row: v.row, name: v.name, type: vt });
+			vars.push({ row: v.row, name: v.name, type: vt, desc: v.desc });
 		}
 
 		// `var x; /// @is {T}` - declaration without an initializer.
@@ -544,10 +755,24 @@ var TypeMasterAnalyzer = (function () {
 			var dkey = dli + "|" + dm[1];
 			if (seen[dkey]) continue;
 			seen[dkey] = true;
-			vars.push({ row: dli, name: dm[1], type: { nm: dh, ex: true } });
+			vars.push({ row: dli, name: dm[1], type: { nm: dh, ex: true }, desc: lineHintDocs[dli] || null });
 		}
 
-		// ---- 3b. global.NAME types ---------------------------------------
+		// ---- 3b. `///@param` types --------------------------------------
+		// Last, so that the annotation outranks anything inferred from the body: `applyTo`
+		// walks `vars` in order and the later entry is the one that ends up in
+		// `localTypes`. (Done after the passes above for the same reason.)
+		var pseen = Object.create(null);
+		for (var pvi = 0; pvi < paramVars.length; pvi++) {
+			var pv = paramVars[pvi];
+			localTypes[pv.name] = pv.type;
+			var pkey = pv.row + "|" + pv.name;
+			if (pseen[pkey]) continue;
+			pseen[pkey] = true;
+			vars.push({ row: pv.row, name: pv.name, type: pv.type });
+		}
+
+		// ---- 3c. global.NAME types ---------------------------------------
 		// Resolved before step 4 so that struct literals on the right-hand side become real
 		// entries of `structs` and get their field list filled below.
 		var globalsOut = Object.create(null);
@@ -591,6 +816,109 @@ var TypeMasterAnalyzer = (function () {
 			idx++;
 		}
 
+		// First `//` between `pos` and the end of its line, skipping string literals.
+		// `mask` cannot help here: it blanks comments *and* string bodies alike, so a `//`
+		// inside `"http://x"` would look exactly like a comment start.
+		//
+		// A `{` on the way means a nested literal / body opened first, so anything after it
+		// belongs to *its* innermost field: in `DEEP: { X: 1, //x 的说明` the sentence is
+		// about `X`, and letting `DEEP` claim it would put it on both.
+		function commentAfter(pos) {
+			var k = pos, nn = text.length;
+			while (k < nn) {
+				var c = text.charAt(k);
+				if (c === "\n") return -1;
+				if (c === "{") return -1;
+				if (c === "\"" || c === "'") {
+					k++;
+					while (k < nn) {
+						var c2 = text.charAt(k);
+						if (c2 === "\\") { k += 2; continue; }
+						k++;
+						if (c2 === c) break;
+					}
+					continue;
+				}
+				if (c === "/" && text.charAt(k + 1) === "/") return k;
+				k++;
+			}
+			return -1;
+		}
+
+		// One annotation body (`@is ...` / `@type ...`) -> `{ d: sentence, t: declared type }`.
+		// The declared type is only *displayed* - the inferred one keeps driving the struct
+		// walk - but it is the only way to say something about `noone`, `null` and other
+		// values the analyzer cannot name.
+		function parseAnnBody(body) {
+			var m = /^@(is|type)\b([^\r\n]*)/.exec(body);
+			if (m == null) return null;
+			var rest = m[2] || "";
+			var br = /\{([^}]*)\}/.exec(rest);
+			var d = rest.replace(/\{[^}]*\}/g, " ").replace(/\s+/g, " ").trim();
+			var dt = br != null ? br[1].replace(/<.*$/, "").trim() : "";
+			if (dt !== "" && !isIdStart(dt.charAt(0))) dt = "";
+			if (d === "" && dt === "") return null;
+			return { d: d === "" ? null : d, t: dt === "" ? null : dt };
+		}
+
+		// The `///@is {T} 说明` (or a plain `//说明`) trailing one struct field:
+		//   PLACE_FROM_STORAGE : false,///@is {bool} 是否允许从仓库取出
+		//   CLICK_INST : noone,//最近点击的实例
+		// `segStart` is the field's segment start, used to make sure the comment belongs
+		// to *this* field and not to a later one written on the same line.
+		function fieldDescAt(ci, segStart) {
+			var commas = 0, lvl = 0;
+			for (var k = segStart; k < ci; k++) {
+				var c = masked.charAt(k);
+				if (c === "(" || c === "[" || c === "{") lvl++;
+				else if (c === ")" || c === "]" || c === "}") lvl--;
+				else if (c === "," && lvl === 0) commas++;
+			}
+			// One comma == this field's own separator; two or more means another field
+			// sits in between, so the comment is that field's.
+			if (commas > 1) return null;
+			var e = text.indexOf("\n", ci);
+			if (e < 0) e = text.length;
+			var body = text.slice(ci, e).replace(/^\/\/+\s*/, "");
+			var ann = parseAnnBody(body);
+			if (ann != null) return ann;
+			if (/^@\w+/.test(body)) return null;            // some other tag, not prose
+			var plain = body.replace(/\s+/g, " ").trim();
+			return plain === "" ? null : { d: plain, t: null };
+		}
+
+		// `/// @is {T} 说明` on the line directly above the field. Only the explicit tags:
+		// a bare `//说明` over a field is far more often a section header than a caption,
+		// and guessing there would end up labelling fields with headings.
+		function annAbove(pos) {
+			var row = rowOf(pos);
+			if (row <= 0) return null;
+			var pl = textLines[row - 1];
+			if (pl == null) return null;
+			var t = pl.replace(/^\s+/, "");
+			if (t.slice(0, 2) !== "//") return null;
+			return parseAnnBody(t.replace(/^\/\/+\s*/, ""));
+		}
+
+		// The sentence trailing one *assignment* on its own line:
+		//   hp = 10; ///@is {number} 生命值
+		//   hp = 10; //生命值
+		// Same rules as a struct field's trailing comment (`//` as well as `///`), only
+		// without the "does the comment belong to this field" dance - an assignment has
+		// nothing else on its line.
+		function trailingDesc(pos) {
+			var ci = commentAfter(pos);
+			if (ci < 0) return null;
+			var e = text.indexOf("\n", ci);
+			if (e < 0) e = text.length;
+			var body = text.slice(ci, e).replace(/^\/\/+\s*/, "");
+			var ann = parseAnnBody(body);
+			if (ann != null) return ann;
+			if (/^@\w+/.test(body)) return null;            // some other tag, not prose
+			var plain = body.replace(/\s+/g, " ").trim();
+			return plain === "" ? null : { d: plain, t: null };
+		}
+
 		function addField(s0, s1, out) {
 			var k = skipSpace(s0, s1);
 			if (k >= s1 || !isIdStart(masked.charAt(k))) return;
@@ -600,7 +928,14 @@ var TypeMasterAnalyzer = (function () {
 			var k2 = skipSpace(k, s1);
 			if (masked.charAt(k2) !== ":") return;                 // not a key: value pair
 			var vs = k2 + 1;
-			out.push({ name: key, type: typeOf(vs, s1) });
+			var ci = commentAfter(keyStart);
+			var an = ci >= 0 ? fieldDescAt(ci, keyStart) : annAbove(keyStart);
+			out.push({
+				name: key,
+				type: typeOf(vs, s1),
+				desc: an != null ? an.d : null,
+				dt: an != null ? an.t : null
+			});
 		}
 
 		// `global.NAME.field = <expr>` - fields filled in after the literal was created.
@@ -624,7 +959,144 @@ var TypeMasterAnalyzer = (function () {
 		var structOut = [];
 		for (var si = 0; si < structPos.length; si++) structOut.push(structs[si] || []);
 
-		return { structs: structOut, vars: vars, returns: returns, globals: globalsOut };
+		// ---- 5. `///@is` sentences written on struct fields -----------------
+		// A field has no `GmlFuncDoc` either, and GMEdit's `field` / `localfield` tooltip
+		// prints nothing at all (`canDocData` only sets `ctx.docs = {}`). So the sentence
+		// is collected here as "struct path -> {sentence, type name}" and `main.js` shows
+		// it on hover: `type bool` + the sentence.
+		var fieldOut = Object.create(null);
+		// One `name -> {d, t}` entry. Two different sentences for the same key mean the
+		// name alone cannot be trusted, so it is marked ambiguous (`null`) and hover stays
+		// silent rather than showing the wrong caption half the time.
+		var noteField = function (key, d, t) {
+			if (key == null || key === "" || d == null) return;
+			var entry = { d: d, t: t != null ? t : null };
+			var cur = fieldOut[key];
+			if (cur === undefined) { fieldOut[key] = entry; return; }
+			if (cur === null) return;                           // already ambiguous
+			if (cur.d !== entry.d) fieldOut[key] = null;
+		};
+		// Only files that actually contain such an annotation pay for the walk.
+		var anyFieldDesc = false;
+		for (var fdi = 0; fdi < structs.length && !anyFieldDesc; fdi++) {
+			var fdl = structs[fdi];
+			if (fdl == null) continue;
+			for (var fdj = 0; fdj < fdl.length; fdj++) {
+				if (fdl[fdj] != null && fdl[fdj].desc != null) { anyFieldDesc = true; break; }
+			}
+		}
+		if (anyFieldDesc) {
+			// A synthesized struct only knows its id, so a field's "name" for lookup is the
+			// path that reaches it: `DATA_STRUCT.PLACE_FROM_STORAGE`. The bare field name is
+			// registered as well - plenty of code reaches a field through a local alias -
+			// but only when every occurrence says the same thing.
+			var walkFields = function (prefix, type, path) {
+				if (type == null || type.st == null) return;
+				if (path.length > 4 || path.indexOf(type.st) >= 0) return;   // depth cap + cycles
+				var list = structs[type.st - 1];
+				if (list == null) return;
+				var next = path.concat([type.st]);
+				for (var wi = 0; wi < list.length; wi++) {
+					var fd = list[wi];
+					if (fd == null) continue;
+					var full = prefix + "." + fd.name;
+					if (fd.desc != null) {
+						var ftn = fd.dt != null ? fd.dt : fieldTypeName(fd.type);
+						noteField(full, fd.desc, ftn);
+						// `{ x : 0, //横坐标 }` is fine for `pos.x`, but `x` alone must stay
+						// unregistered - see BUILTIN_VARS.
+						if (!BUILTIN_VARS[fd.name]) noteField(fd.name, fd.desc, ftn);
+					}
+					walkFields(full, fd.type, next);
+				}
+			};
+			for (var gp in globalsOut) {
+				if (!Object.prototype.hasOwnProperty.call(globalsOut, gp)) continue;
+				walkFields(gp, globalsOut[gp], []);
+			}
+			for (var vvi = 0; vvi < vars.length; vvi++) {
+				var vv = vars[vvi];
+				if (vv.type != null && vv.type.st != null) walkFields(vv.name, vv.type, []);
+			}
+		}
+
+		// ---- 6. `///@is` sentences written on constructor members -----------
+		//   function Item(_name) constructor {
+		//       hp = 10;                ///@is {number} 生命值
+		//       name = _name;           //名字
+		//       bag = { slots : [] };
+		//       var tmp = 0;            ← `var` 是真正的局部变量，不是成员
+		//   }
+		// `hp` is an instance field: GMEdit already lists it after `item.`
+		// (`GmlSeekerProcField.addFieldHint` with `s == "constructor"`), but hovering it
+		// shows nothing at all. Register the sentence under `Item.hp` and the bare `hp`,
+		// so `item.hp`, `self.hp` and `_x.hp` all answer.
+		//
+		// A dedicated scan rather than `rawAssigns`: that list drops keyword names, and
+		// `name = _name` / `x = 0` are exactly the members a constructor is full of.
+		// Both spellings: `function Item() constructor` and `Item = function () constructor`.
+		var reCtor = /(?:function\s+([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*)\s*=\s*function)\s*\([^)]*\)[^{;]*\bconstructor\b/g;
+		var cm;
+		while ((cm = reCtor.exec(masked)) !== null) {
+			var cname = cm[1] != null ? cm[1] : cm[2];
+			var copen = masked.indexOf("{", cm.index + cm[0].length);
+			if (copen < 0) continue;
+			// An unfinished constructor (the closing brace is not typed yet) still gets its
+			// members: files are analysed while being edited, not only when complete.
+			var cclose = matchClose(masked, copen);
+			if (cclose < 0) cclose = n;
+			var ck = copen + 1;
+			var varNames = Object.create(null);
+			while (ck < cclose) {
+				if (!isIdStart(masked.charAt(ck))) { ck++; continue; }
+				if (isIdPart(masked.charAt(ck - 1))) { ck++; continue; }
+				var wstart = ck, wend = ck;
+				while (wend < cclose && isIdPart(masked.charAt(wend))) wend++;
+				var wname = masked.slice(wstart, wend);
+				ck = wend;
+				// A nested `fn = function () { ... }` body has its own locals; skip the
+				// whole thing instead of mistaking them for members.
+				if (wname === "function") {
+					var fb = masked.indexOf("{", wend);
+					if (fb < 0 || fb > cclose) break;
+					var fe = matchClose(masked, fb);
+					ck = fe < 0 ? cclose : fe + 1;
+					continue;
+				}
+				// `var x = ...` declares a local. `this.x = ...` / `a.b = ...` is a member
+				// assignment on some *other* object, and step 5 already covers the literal
+				// that `this` refers to. A name declared with `var` earlier and re-assigned
+				// without it (`_value_x = ...`) is still that local, not a member.
+				// Recorded *before* the `=` test, because `var _v;` has no initializer.
+				var pw = wstart - 1;
+				while (pw >= 0 && isSpace(masked.charAt(pw))) pw--;
+				if (pw >= 0 && masked.charAt(pw) === ".") continue;
+				var ws2 = pw;
+				while (ws2 >= 0 && isIdPart(masked.charAt(ws2))) ws2--;
+				var pword = masked.slice(ws2 + 1, pw + 1);
+				if (pword === "var") { varNames[wname] = true; continue; }
+				if (varNames[wname]) continue;
+				var eq = skipSpace(wend, cclose);
+				if (masked.charAt(eq) !== "=" || masked.charAt(eq + 1) === "=" ||
+					masked.charAt(eq + 1) === ">") continue;
+				var crow = rowOf(wstart);
+				var cd = lineHintDocs[crow];
+				var cdt = lineHints[crow] != null ? lineHints[crow] : null;
+				if (cd == null) {
+					var ann = trailingDesc(skipSpace(eq + 1, cclose));
+					cd = ann != null ? ann.d : null;
+					cdt = ann != null ? ann.t : null;
+				}
+				if (cd == null) continue;                        // nothing to show
+				var cvs = skipSpace(eq + 1, cclose);
+				var ctv = cdt != null ? cdt : fieldTypeName(typeOf(cvs, scanExprEnd(cvs)));
+				noteField(cname + "." + wname, cd, ctv);
+				if (!BUILTIN_VARS[wname]) noteField(wname, cd, ctv);
+			}
+		}
+
+		return { structs: structOut, vars: vars, returns: returns, globals: globalsOut,
+			docs: docsOut, fields: fieldOut };
 	}
 
 	// Collect every *definition site* in one file, for the middle-click "go to definition"

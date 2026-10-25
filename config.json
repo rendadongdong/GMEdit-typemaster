@@ -1,6 +1,6 @@
 {
 	"name": "gm-typemaster",
-	"description": "Automatic type inference for GML (struct fields / function return types), middle-click go-to-definition for user code, and event members in the outline view.",
+	"description": "Automatic type inference for GML (struct fields / function return types / ///@param arguments), ///@desc shown in tooltips and the status bar, ///@is descriptions on hover (local variables, struct fields and constructor members), middle-click go-to-definition for user code, event members in the outline view, and a tree-header button that reloads every open file from disk in one click.",
 	"scripts": ["analyzer.js", "main.js"],
 	"stylesheets": ["styles.css"]
 }

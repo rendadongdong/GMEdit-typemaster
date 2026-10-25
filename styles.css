@@ -22,3 +22,183 @@
 	content: "▪";
 	font-size: 10px;
 }
+
+/* gm-typemaster / the aside pane's own tab strip.
+   `#aside_editor` is a `.ace_container` (display:flex; flex-direction:column) whose
+   `.ace_editor` grows, so the strip only has to claim a fixed height. Colours are
+   neutral-grey translucency + `currentColor` so it reads the same in light and dark
+   themes without knowing which one is active. */
+#aside_editor > .tm-aside-tabs {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: stretch;
+	height: 26px;
+	overflow-x: auto;
+	overflow-y: hidden;
+	background: rgba(127, 127, 127, 0.10);
+	border-bottom: 1px solid rgba(127, 127, 127, 0.35);
+	font: inherit;
+	font-size: 12px;
+	line-height: 25px;
+	white-space: nowrap;
+	user-select: none;
+	scrollbar-width: thin;
+}
+
+#aside_editor > .tm-aside-tabs::-webkit-scrollbar {
+	height: 4px;
+}
+
+#aside_editor > .tm-aside-tabs::-webkit-scrollbar-thumb {
+	background: rgba(127, 127, 127, 0.45);
+	border-radius: 2px;
+}
+
+#aside_editor > .tm-aside-tabs > .tm-aside-tab {
+	display: flex;
+	align-items: center;
+	flex: 0 0 auto;
+	max-width: 220px;
+	padding: 0 4px 0 10px;
+	border-right: 1px solid rgba(127, 127, 127, 0.25);
+	color: inherit;
+	opacity: 0.62;
+	cursor: pointer;
+}
+
+#aside_editor > .tm-aside-tabs > .tm-aside-tab:hover {
+	opacity: 0.95;
+	background: rgba(127, 127, 127, 0.14);
+}
+
+#aside_editor > .tm-aside-tabs > .tm-aside-tab-current {
+	opacity: 1;
+	background: rgba(127, 127, 127, 0.22);
+	box-shadow: inset 0 -2px 0 currentColor;
+}
+
+#aside_editor > .tm-aside-tabs > .tm-aside-tab > .tm-aside-tab-title {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+#aside_editor > .tm-aside-tabs > .tm-aside-tab > .tm-aside-tab-close {
+	flex: 0 0 auto;
+	width: 14px;
+	height: 14px;
+	margin-left: 6px;
+	border-radius: 3px;
+	font-size: 13px;
+	line-height: 13px;
+	text-align: center;
+	opacity: 0.55;
+}
+
+#aside_editor > .tm-aside-tabs > .tm-aside-tab > .tm-aside-tab-close:hover {
+	opacity: 1;
+	background: rgba(127, 127, 127, 0.40);
+}
+
+/* gm-typemaster / the `///@desc` text appended to the argument hint in the status bar.
+   The hint itself is a single nowrap line, so the description simply trails the
+   signature at reduced contrast - it must not compete with the argument names. */
+.ace_status-bar > .ace_status-comp > .tm-hint-desc {
+	margin-left: 0.15em;
+	opacity: 0.62;
+	font-style: italic;
+}
+
+/* gm-typemaster / the "reload all open files" button in the project tree header.
+   It reuses GMEdit's `.system-button` box (36x28, flex-centred) so it lines up with the
+   menu burger next to it and inherits the theme's hover/active background. `color:
+   inherit` + `stroke="currentColor"` is what keeps the glyph readable in both themes:
+   the dark theme recolours the stock buttons' svg children by hand, and this one is not
+   in its list. */
+#tree-td .chrome-tabs.project-name > .system-buttons > .tm-reload-all {
+	position: relative;
+	color: inherit;
+	cursor: pointer;
+}
+
+#tree-td .chrome-tabs.project-name > .system-buttons > .tm-reload-all > svg {
+	display: block;
+	pointer-events: none;
+}
+
+/* "there is something to reload": one open file is newer on disk than the buffer was.
+   The node itself (`.tm-dot`, a real child) also carries the same geometry inline from
+   `makeDot()`, so this rule is the fallback for a stale stylesheet rather than the only
+   thing making the dot visible. Green is what the user asked for; it is a "there is
+   news" marker, not a diff colour. The dark ring keeps it readable on both the light
+   and the dark tree header. */
+#tree-td .chrome-tabs.project-name > .system-buttons > .tm-reload-all > .tm-dot {
+	position: absolute;
+	left: 7px;
+	top: 4px;
+	width: 6px;
+	height: 6px;
+	border-radius: 50%;
+	background: #4cc764;
+	box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.38);
+	pointer-events: none;
+	display: none;
+	z-index: 2;
+}
+
+#tree-td .chrome-tabs.project-name > .system-buttons > .tm-reload-all > .tm-dot.tm-dot-on {
+	display: block;
+	animation: tm-dot-in 0.18s ease-out;
+}
+
+/* The class on the button means the same thing; kept in sync so either one alone is
+   enough to show the dot. */
+#tree-td .chrome-tabs.project-name > .system-buttons > .tm-reload-all.tm-has-changes > .tm-dot {
+	display: block;
+}
+
+@keyframes tm-dot-in {
+	from { transform: scale(0.3); opacity: 0; }
+	to { transform: scale(1); opacity: 1; }
+}
+
+#tree-td .chrome-tabs.project-name > .system-buttons > .tm-reload-all.tm-spin > svg {
+	animation: tm-reload-spin 0.5s ease-in-out;
+}
+
+@keyframes tm-reload-spin {
+	from { transform: rotate(0deg); }
+	to { transform: rotate(360deg); }
+}
+
+/* `#project-name` is `calc(100% - 28px)` for the single burger; the second slot has to
+   come out of the same width or the title slides under the buttons. */
+#tree-td .chrome-tabs.project-name.tm-has-reload > #project-name {
+	width: calc(100% - 64px);
+}
+
+/* gm-typemaster / the one-line report a reload-all click prints under the tree header.
+   Fixed to the viewport so it does not scroll with `#tree-td`'s treeview. Dark chip with
+   light text in both themes - a toast is transient and only ever appears for ~2.6s. */
+.tm-toast {
+	position: fixed;
+	left: 10px;
+	top: 42px;
+	z-index: 9999;
+	max-width: 340px;
+	padding: 5px 10px;
+	border-radius: 4px;
+	background: rgba(24, 24, 24, 0.86);
+	color: #f3f3f3;
+	font: 12px/1.35 "Segoe UI", system-ui, sans-serif;
+	box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+	opacity: 0;
+	transform: translateY(-4px);
+	transition: opacity 0.14s ease, transform 0.14s ease;
+	pointer-events: none;
+}
+
+.tm-toast.tm-toast-on {
+	opacity: 1;
+	transform: translateY(0);
+}
