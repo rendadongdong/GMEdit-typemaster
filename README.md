@@ -170,9 +170,15 @@
      现在中键解析发现索引还没建好时会先同步建一次（约 0.3s，一次性），所以刚打开工程/刚 `Ctrl+R`
      之后的第一下点击也能直接跳。
    - 找到定义但打开失败（文件被锁、工程还没加载完）时也**吞掉这次点击**，不会再掉到搜索页去。
-   - 对象事件是按「对象 `.yy` + 事件名」定位的，GMEdit 把整个对象放在一个标签页里、用
-     `#event create` 这样的分段；插件会先切到对应事件段，再按名字定位到具体那一行，
-     不受文件头 `///` 被搬到分段行的影响。
+   - **会滚到定义那一行，而不只是把文件打开。** 这里有两个坑：① `.yy` 打开后是一个把该对象
+     所有 `.gml` 按 `#event` 拼起来的缓冲区，磁盘上的行号在里面没有意义；② `GmlFile.open`
+     返回时标签还没真正切过去（新的 `.yy` 要先读所有事件文件、建索引、挂到编辑器上），而 GMEdit
+     自己的 `navigate` 是**无条件滚 `Main.aceEditor`** 的——那一刻它还指着上一个文件，于是滚动
+     落在旧文件上，新文件停在第一行。所以插件不把 `{pos: ...}` / `{def: ...}` 交给 GMEdit，而是
+     自己等标签成为当前文件（16ms 一次，最多约 2.4 秒），再在缓冲区里按「`#event` 段 + 名字」
+     文本定位，最后 `gotoLine` + `scrollToLine`。段名只比对第一个词（GMEdit 会把文件头的 `///`
+     说明拼到 `#event` 行尾）；索引记的段过时就退到全文搜索；还不行就按记下的偏移落回同一个
+     事件段。这三条路都能保证不会停在文件顶部。
    - 认得：`function name()`、`name = function()`、`var/static/let/const name =`、`name = ...`、
      `#macro`、`enum`、`global.NAME =`。同一个名字有多处定义时，优先接收者对象的那一处，
      其次当前文件，再次索引里靠前的。
@@ -375,8 +381,19 @@
       缓冲区"已知版本"不一致。判定**不用 `mtime > file.time`**（GMEdit 自己的做法）：`file.time`
       在每次聚焦时就被 `checkChanges` 先改成新 mtime 了——包括你回答「Keep current」的那次，
       于是你正在看的那个标签永远判不出"变了"。插件自己记一份**内容基线**（路径 →
-      `{mtime, sig}`，`sig` 是归一化后文本的 djb2 哈希 + 长度），`mtime` 只当便宜的预筛，
+      `{mtime, sig, subs}`，`sig` 是归一化后文本的 djb2 哈希 + 长度），`mtime` 只当便宜的预筛，
       变了才读内容比对签名；只动 mtime、内容没变的（CRLF 翻转、工具重写同内容）不算变化。
+    - **多文件的标签会连它的每个组成文件一起看**，这是"绿点有时候不亮"的正主：
+      - GMS2 的对象 / 时间线标签，`path` 是 `obj_xxx.yy`，而事件各在 `Create_0.gml`、
+        `Step_0.gml` 里。用别的工具改事件时 **`.yy` 一个字节都没动**，而 `readContent()`
+        只读 `.yy` 原文——所以改脚本 `.gml` 会亮、改对象事件不亮，看起来就像随机失灵。
+        现在会把 `file.extraFiles`（GMEdit 自己 `loadCode` 时填的）里每个事件文件的 mtime
+        累进预筛、把每个文件的原文并进签名。
+      - 脚本组标签（`#define` 多文件，`file.multidata`）同理。
+      - 标签还没被 load 过时 `extraFiles` 是空的，`.yy` 会退化成**列同目录的 `*.gml`**，
+        所以恢复会话后没点开的对象标签也能算对。
+      - 子文件被删也算变化（签名里留了个"没了"的标记），子文件列表**从无到有**则只当作
+        "我们看到了更多"、重建基线，不会自己亮一下。
       每 1.5 秒看一次（只跳过 `document.hidden`，最小化那种后台；**不看 `document.hasFocus()`**——
       Electron 在 devtools 或系统对话框拿到焦点时会返回 false，那种"轮询悄悄停了"正是绿点不亮的
       根因之一），窗口重新拿到焦点时再补一次；tooltip 里会写清有几个文件变了。点完按钮、文件重读
@@ -388,6 +405,8 @@
       「Reload file」之后，那个标签不会留下一个骗人的绿点。
     - 「Keep current」留下的旧副本能靠基线认出来（内容 == 上一版磁盘内容），所以它**不算脏**，
       点按钮会直接换成新内容——这正是这个按钮存在的理由：不用真的丢掉未保存的改动。
+      这条只对单文件标签成立；多文件标签（对象 / 脚本组）的缓冲区是拼起来的文本，跟"上一版
+      磁盘原文"没法逐字比，所以那里一律当作脏——宁可让你按住 Shift，也不误覆盖。
     - 命令面板里还有两条：
       - `TypeMaster: Reload all open files from disk`
       - `TypeMaster: Check the green dot (writes diag.json)` —— 立刻重算一遍并把自检写进
@@ -456,7 +475,8 @@ Linux 通常 `~/.config/AceGM/`），同样建 `GMEdit/plugins/gm-typemaster`。
   `changedOnDisk` 是绿点当前显示的数目，`diskWatch` 是绿点的内部状态（`build` 当前版本戳、
   `polling` 轮询在跑、`baselines` 记了几个基线、`signalsHooked` 是否挂上了 `fileSave`/`fileReload`、
   `mtimeFailures` 上一轮读不到 mtime 的次数——这个数字等于打开的文件数时，绿点不可能亮，
-  日志里也会有一行说明；还有 `dotInDom` / `diagPath` / `lastError`）。
+  日志里也会有一行说明；`files[i].subFiles` / `stamp` 是多文件标签（对象、脚本组）到底算进了
+  几个组成文件；还有 `dotInDom` / `diagPath` / `lastError`）。
 
 ## 工程索引（跨文件函数返回值）
 
@@ -613,10 +633,15 @@ hover 底色、和主题的适配全是照抄 `.system-button` 的，没有自�
   "the green dot cannot work"，而不是安静地什么都不显示。
 
 绿点本身走的是**轮询**而不是 `fs.watch`：一个 GMS 工程意味着每个文件一个 watcher，IDE 一保存就是
-一串事件，而这个信号只要"差不多及时"就够了。`statSync` × 打开的文件数，1.5 秒一次，代价可以忽略；
-只有 `document.hidden`（最小化/完全被遮住）时整个跳过，`window.focus` 时补一次。状态记在
-`RELOAD_COUNT` 里，并且每次都重新读一遍 class 本身——这样即使别的什么把 class 抹掉了，下一轮
-也会自己长回来。
+一串事件，而这个信号只要"差不多及时"就够了。预筛是 `statSync`（多文件标签再加上它每个组成文件的
+`statSync`），1.5 秒一次，代价可以忽略；只有 `document.hidden`（最小化/完全被遮住）时整个跳过，
+`window.focus` 时补一次。状态记在 `RELOAD_COUNT` 里，并且每次都重新读一遍 class 本身——这样即使
+别的什么把 class 抹掉了，下一轮也会自己长回来。
+
+为什么要连组成文件的 mtime 一起算：`GmlFile.readContent()` 就是
+`readTextFileSync(this.path)`，对对象标签只拿到 `.yy` 的 JSON。用它做预筛和签名，等于对着一个
+外部工具根本不会碰的文件问"你变了吗"——这是这一版之前"绿点有时候亮、有时候不亮"的全部原因：
+改脚本亮，改对象事件不亮。
 
 这条判断链路（stat → 读文件 → 比签名 → 切 class → 画圆点）每一步都可能是"静默失败"，
 所以它同时往 `plugins/gm-typemaster/diag.json` 写自检：见上面「Check the green dot」那条命令。
@@ -639,6 +664,13 @@ hover 底色、和主题的适配全是照抄 `.system-button` 的，没有自�
 - `middle-click go-to-definition hooked (capture phase)` —— 中键跳转已接管（只在启动时打一次）。
 - `jump to <名字> -> <路径>:<行> (<类型>)` —— 中键跳转成功；没这行说明既没解析出来、索引里也没有。
   目标是当前文件时显示 `jump to <名字> -> current buffer:<行> (<类型>)`。
+- `jump: caret at <文件>:<行> (<依据>)` —— 光标真正落到哪一行、靠什么找到的：
+  `section`（索引记的事件段里按名字命中）、`search`（段过时，全文里按名字命中）、
+  `offset`（名字没找到，按记下的偏移落回同一段）、`line`（普通 `.gml`，直接用文件行号）。
+- `jump: gave up scrolling to '<名字>' after N tries` —— 标签始终没成为当前文件（通常是被别的
+  窗口/对话框抢走了），文件已经打开，但停在顶部。再点一次即可。
+- `jump: nothing to scroll to for <路径>` —— `GmlFile.open` 返回空（`KExtern` 之类会交给外部程序
+  打开），没有可以滚动的编辑器。
 - `no definition of '<名字>' on <对象>, using <另一处>` —— 接收者对象里找不到这个方法，退到了别处的同名定义。
 - `__typeMaster.diag()` / `__typeMaster.diag("Open_item")` —— 一条命令看清中键链路：
   `captureHooked`（捕获监听是否装上）、`indexReady`、`definitions`、`eventMapEntries`

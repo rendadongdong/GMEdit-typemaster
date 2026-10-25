@@ -1137,38 +1137,121 @@
 		return m[1].replace(/\.gml$/i, "");
 	}
 
-	// Inside an object buffer, locate the definition by scanning the matching `#event` block.
-	// Text search (instead of `nav.pos`) stays correct even when GMEdit moves a file's `///`
-	// header onto the `#event` line, which shifts every following row by one.
-	function refineEventLocation(def) {
+	// Sections of the buffer GMEdit is really showing. A `.yy` is the object's `.gml` files
+	// concatenated behind `#event` markers, so a row recorded from the file on disk means
+	// nothing there. The name is compared on its first word only: GMEdit appends a file's
+	// `///` header to the `#event` line itself, giving `#event create ///@desc ...`.
+	function bufferSections(session) {
+		var out = [];
+		var lines = session.getLength();
+		for (var i = 0; i < lines; i++) {
+			var t = session.getLine(i);
+			if (t.charAt(0) !== "#") continue;
+			var mm = /^#(?:event|define|moment|target)[ \t]+(.+)$/.exec(t);
+			if (mm == null) continue;
+			if (out.length > 0) out[out.length - 1].end = i;
+			out.push({ name: mm[1].trim().split(/[ \t]+/)[0], start: i, end: lines });
+		}
+		return out;
+	}
+
+	// Where does `def.name` live inside `session`? Returns `null` when the buffer has no
+	// sections at all (a plain `.gml`, where the recorded row is already file-relative),
+	// `{row: -1}` when it has sections but the name is nowhere in them (text still being
+	// loaded), otherwise the row plus how it was found.
+	//
+	// Text search, not `nav.pos`: the row from disk cannot be reused inside a `.yy` buffer,
+	// and GMEdit moving a file's `///` header onto the `#event` line shifts every row by one.
+	function locateDefinitionRow(session, def) {
+		var secs = bufferSections(session);
+		if (secs.length === 0) return null;
+		var name = def.name;
+		// `var name = ...` / `name = ...` / `function name(...)`; a bare `name(...)` is a call,
+		// not a definition, so it must not match.
+		var rx = new RegExp("^(?:var|static|let|const)[ \\t]+" + name + "\\b|^" +
+			name + "\\b[ \\t]*=(?!=)|^function[ \\t]+" + name + "\\b|^enum[ \\t]+" + name + "\\b");
+		var home = null, i;
+		for (i = 0; i < secs.length; i++) {
+			if (def.sub != null && secs[i].name === def.sub) { home = secs[i]; break; }
+		}
+		if (home != null) {
+			for (i = home.start + 1; i < home.end; i++) {
+				if (rx.test(session.getLine(i).trim())) return { row: i, how: "section" };
+			}
+		}
+		// The section recorded by the index can be stale (the event moved, the file was
+		// renamed), so the whole buffer is searched next; a method name is unique per object
+		// in practice.
+		for (var s = 0; s < secs.length; s++) {
+			for (i = secs[s].start + 1; i < secs[s].end; i++) {
+				if (rx.test(session.getLine(i).trim())) return { row: i, how: "search" };
+			}
+		}
+		if (home != null) {
+			// Right section, name not found: use the offset the index recorded, clamped to
+			// that section. Better than leaving the file scrolled to the top.
+			var row = home.start + 1 + Math.max(0, def.row | 0);
+			if (row >= home.end) row = home.end - 1;
+			return { row: row, how: "offset" };
+		}
+		return { row: -1, how: "missing" };
+	}
+
+	// `GmlFile.open` returns before the new tab is wired up: the file has to be read (a `.yy`
+	// means reading every event `.gml`), indexed and attached, and until that swap happens
+	// `Main.aceEditor` still points at the *previous* session. GMEdit's own `navigate` scrolls
+	// `Main.aceEditor` unconditionally, so scrolling that early moves the old file and leaves
+	// the new one at row 0 - which is exactly what "the right file opens, but not at the
+	// definition" looks like. So wait for the tab to actually be current, then place the
+	// caret through the editor that is showing it.
+	var REVEAL_STEP_MS = 16;
+	var REVEAL_MAX_TRIES = 150;             // ~2.4s
+
+	function revealDefinition(pick, file, attempt) {
+		attempt = attempt | 0;
+		var ed = null, session = null;
+		try { ed = (window.Main && window.Main.aceEditor) || null; } catch (e0) { ed = null; }
+		try { session = file != null && file.codeEditor != null ? file.codeEditor.session : null; }
+		catch (e1) { session = null; }
+
+		var live = false;
+		try { live = ed != null && session != null && ed.getSession() === session; } catch (e2) { live = false; }
+
+		var spot = null;
+		if (live) {
+			try { spot = locateDefinitionRow(session, pick); } catch (e3) { spot = null; }
+			if (spot == null) {
+				// No sections. A `.yy` always has them, so a buffer that is still empty means
+				// the text has not been assembled yet - wait instead of using a row number that
+				// only makes sense in the source `.gml`.
+				var empty = false;
+				try { empty = session.getLength() <= 1; } catch (e5) { empty = false; }
+				if (pick.sub != null && empty) live = false;
+				else spot = { row: Math.max(0, pick.row | 0), how: "line" };
+			} else if (spot.row < 0) {
+				live = false;               // sections exist but the text is not there yet
+			}
+		}
+		if (!live) {
+			if (attempt >= REVEAL_MAX_TRIES) {
+				log("jump: gave up scrolling to `" + pick.name + "` after " + attempt +
+					" tries - the tab did not become active");
+				return false;
+			}
+			window.setTimeout(function () { revealDefinition(pick, file, attempt + 1); }, REVEAL_STEP_MS);
+			return false;
+		}
+
+		var row = Math.max(0, spot.row | 0);
+		var col = spot.how === "line" ? Math.max(0, pick.col | 0) : 0;
 		try {
-			var ed = window.Main && window.Main.aceEditor;
-			var session = ed && ed.getSession();
-			if (!session) return;
-			var lines = session.getLength();
-			var start = -1, end = lines;
-			for (var i = 0; i < lines; i++) {
-				var t = session.getLine(i);
-				if (t.charAt(0) !== "#") continue;
-				var mm = /^#(?:event|define|moment|target)[ \t]+(.+)$/.exec(t);
-				if (mm == null) continue;
-				if (start < 0) {
-					if (mm[1].trim() === def.sub) start = i;
-				} else { end = i; break; }
-			}
-			if (start < 0) return;
-			// `var name = ...` / `name = ...` / `function name(...)`; a bare `name(...)` is a call,
-			// not a definition, so it must not match.
-			var rx = new RegExp("^(?:var|static|let|const)[ \\t]+" + def.name + "\\b|^" +
-				def.name + "\\b[ \\t]*=(?!=)|^function[ \\t]+" + def.name + "\\b");
-			for (var r = start + 1; r < end; r++) {
-				if (rx.test(session.getLine(r).trim())) {
-					ed.gotoLine(r + 1, 0);
-					return;
-				}
-			}
-			ed.gotoLine(start + 2, 0);
-		} catch (e) { log("could not refine event location:", e); }
+			if (typeof ed.clearSelection === "function") ed.clearSelection();
+			if (typeof ed.focus === "function") ed.focus();
+			ed.gotoLine(row + 1, col);
+			if (typeof ed.scrollToLine === "function") ed.scrollToLine(row);
+		} catch (e4) { log("jump: could not place the caret:", e4); return false; }
+		log("jump: caret at " + baseName(pick.path) + ":" + (row + 1) + " (" + spot.how + ")");
+		return true;
 	}
 
 	// Objects can share a method name (`L_release_func` is defined 19 times in this project) and
@@ -1272,23 +1355,32 @@
 		if (pick.inBuffer) {
 			var ed = (window.Main && window.Main.aceEditor) || window.aceEditor;
 			if (ed == null) return false;
-			try { ed.gotoLine(pick.row + 1, pick.col); } catch (e) { return false; }
+			try {
+				if (typeof ed.focus === "function") ed.focus();
+				ed.gotoLine(pick.row + 1, pick.col);
+				if (typeof ed.scrollToLine === "function") ed.scrollToLine(pick.row);
+			} catch (e) { return false; }
 			log("jump to " + name + " -> current buffer:" + (pick.row + 1) + " (" + pick.kind + ")");
 			return true;
 		}
 		var GmlFile = G("gml.file.GmlFile");
 		if (GmlFile == null) return false;
+		var file = null;
 		try {
-			if (pick.sub != null) {
-				GmlFile.open(pick.obj, pick.path, { def: pick.sub });
-				window.setTimeout(function () { refineEventLocation(pick); }, 60);
-			} else {
-				GmlFile.open(baseName(pick.path), pick.path,
-					{ pos: { row: pick.row, column: pick.col } });
-			}
+			// No `nav` on purpose. GMEdit would scroll `Main.aceEditor` from inside its own
+			// `setTimeout`, before the tab swap has finished - that moves the *previous* file
+			// and leaves the new one at the top. `revealDefinition` waits for the swap and
+			// places the caret itself, which also covers a plain `.gml`.
+			file = GmlFile.open(pick.sub != null ? pick.obj : baseName(pick.path), pick.path, null);
 		} catch (e) {
 			log("jump failed:", e);
 			return false;
+		}
+		if (file == null) {
+			// `kind.create` may return null (external-file kinds: it opens another app).
+			log("jump: nothing to scroll to for " + pick.path);
+		} else {
+			try { revealDefinition(pick, file); } catch (e2) { log("jump: reveal failed:", e2); }
 		}
 		log("jump to " + name + " -> " + pick.path + ":" + (pick.row + 1) + " (" + pick.kind + ")");
 		return true;
@@ -2509,7 +2601,7 @@
 	// to look at: if the file still says an older stamp, the plugin was never reloaded
 	// (Ctrl+R reloads the *project*, not the plugin - the command palette's "Reload GMEdit"
 	// or a restart is what re-reads main.js from disk).
-	var BUILD = "dot-2026-10-25c";
+	var BUILD = "dot-2026-10-25e";
 
 	var RELOAD_TITLE = "Reload every open file from disk\n" +
 		"Shift+click: also the tabs that have unsaved edits";
@@ -2583,7 +2675,8 @@
 	// So we keep our own baseline: the bytes the buffer was known to match. A file counts
 	// as changed when its text differs from that baseline. `mtime` stays on as a cheap
 	// pre-filter, so a file is only read when something actually touched it.
-	var DISK_BASE = Object.create(null);   // path -> { mtime, sig, prevSig, prevMtime }
+	var DISK_BASE = Object.create(null);   // path -> { mtime, sig, prevSig, prevMtime, subs }
+	var MULTI_WARNED = Object.create(null);   // path -> true, for the one-shot "no sub-files" log
 	var CHANGE_HOOKED = false;
 
 	// djb2-xor over the normalised text. Cheap, and the length is part of it, so a swap of
@@ -2604,7 +2697,7 @@
 	var DISK_STAT_FAIL = 0;
 	var DISK_STAT_WARNED = false;
 
-	function mtimeOf(path) {
+	function mtimeOf(path, quiet) {
 		try {
 			var FS = window.Electron_FS;
 			if (FS != null && typeof FS.statSync === "function") {
@@ -2626,8 +2719,132 @@
 				if (t2 != null && t2 > 0) return t2;
 			}
 		} catch (e3) { /* ignore */ }
-		DISK_STAT_FAIL++;
+		// Sub-file probes pass `quiet`: one missing event file is normal (a GMS2 object can
+		// list an event whose .gml was never created), and counting it would make the
+		// "nothing readable at all" warning fire on a setup that is actually fine.
+		if (quiet !== true) DISK_STAT_FAIL++;
 		return 0;
+	}
+
+	// ---- what the tab is actually showing ---------------------------------------
+	// `readContent()` is `readTextFileSync(this.path)` - the *main* file only. For the two
+	// multi-file kinds that is not what the tab shows:
+	//   GMS2 object / timeline -> the .yy **plus** every event .gml, as "#event name"
+	//   script group           -> "#define name" sections read from several files
+	// Both fill `file.extraFiles` while building the code; `KGmlMultifile` also keeps the
+	// same list in `file.multidata.items`.
+	//
+	// This was the "the dot only shows up sometimes" bug: editing an object's Create event
+	// in another tool leaves the .yy untouched, so both the mtime test and the content test
+	// were looking at a file that really had not changed. Plain .gml tabs worked, event
+	// tabs never did.
+	function subPathsOf(file) {
+		var out = [];
+		function add(p) {
+			if (typeof p === "string" && p !== "" && out.indexOf(p) < 0) out.push(p);
+		}
+		try {
+			var ex = file.extraFiles;
+			if (ex != null && ex.length != null) {
+				for (var i = 0; i < ex.length; i++) {
+					var e = ex[i];
+					add((e != null && typeof e === "object") ? e.path : e);
+				}
+			}
+		} catch (e1) { /* ignore */ }
+		try {
+			var md = file.multidata;
+			var items = (md != null) ? md.items : null;
+			if (items != null && items.length != null) {
+				for (var j = 0; j < items.length; j++) {
+					if (items[j] != null) add(items[j].path);
+				}
+			}
+		} catch (e2) { /* ignore */ }
+		// Neither list survives a tab that was restored without being loaded yet. A GMS2
+		// object folder holds nothing but its events, so the listing is a safe stand-in.
+		if (out.length === 0 && /\.yy$/i.test(file.path)) {
+			try {
+				var dir = String(file.path).replace(/[\\/][^\\/]*$/, "");
+				var names = readDirOf(dir);
+				for (var k = 0; k < names.length; k++) {
+					if (/\.gml$/i.test(names[k])) add(dir + "/" + names[k]);
+				}
+			} catch (e3) { /* ignore */ }
+		}
+		return out;
+	}
+
+	// Is this a kind whose tab content is assembled from several files? Both are known by
+	// class, so `instanceof` is exact - a sprite `.yy` has no sub-files and must not be
+	// mistaken for an object.
+	function looksLikeEventKind(file) {
+		try {
+			var cls = G("file.kind.yy.KYyEvents");
+			if (cls != null && file.kind instanceof cls) return true;
+		} catch (e) { /* ignore */ }
+		try {
+			var multi = G("file.kind.gml.KGmlMultifile");
+			if (multi != null && file.kind instanceof multi) return true;
+		} catch (e2) { /* ignore */ }
+		return false;
+	}
+
+	function readDirOf(dir) {
+		try {
+			var FS = window.Electron_FS;
+			if (FS != null && typeof FS.readdirSync === "function") return FS.readdirSync(dir) || [];
+		} catch (e) { /* ignore */ }
+		try {
+			var wrap = G("electron.FileWrap");
+			if (wrap != null && typeof wrap.readdirSync === "function") return wrap.readdirSync(dir) || [];
+		} catch (e2) { /* ignore */ }
+		return [];
+	}
+
+	// Same source `readContent()` uses, so a project mounted through GMEdit's virtual
+	// filesystem still resolves. `Electron_FS` is only the last resort.
+	function readTextOf(path) {
+		try {
+			var wrap = window.electron_FileWrap || G("electron.FileWrap");
+			if (wrap != null && typeof wrap.readTextFileSync === "function") {
+				return wrap.readTextFileSync(path);
+			}
+		} catch (e) { /* fall through */ }
+		try {
+			var FS = window.Electron_FS;
+			if (FS != null && typeof FS.readFileSync === "function") return FS.readFileSync(path, "utf8");
+		} catch (e2) { /* ignore */ }
+		return null;
+	}
+
+	// Everything the tab is built from, in one string, so a single hash covers all of it.
+	function diskTextOf(file) {
+		var main = null;
+		try { main = file.readContent(); } catch (e) { return null; }
+		if (typeof main !== "string") return null;
+		var subs = subPathsOf(file);
+		if (subs.length === 0) return main;
+		var parts = [main];
+		for (var i = 0; i < subs.length; i++) {
+			var t = readTextOf(subs[i]);
+			// A sub-file that vanished is a change too, so it must move the hash.
+			parts.push((t == null) ? "\u0000gone" : t);
+		}
+		return parts.join("\u0000\u0001");
+	}
+
+	// Cheap pre-filter covering the same set of files. MTimes only ever grow, so summing
+	// them cannot cancel an edit out the way an XOR would.
+	function diskStamp(file) {
+		var t = mtimeOf(file.path, false);
+		if (!(t > 0)) return 0;
+		var subs = subPathsOf(file);
+		for (var i = 0; i < subs.length; i++) {
+			var s = mtimeOf(subs[i], true);
+			if (s > 0) t += s;
+		}
+		return t;
 	}
 
 	// "The buffer holds these bytes now." Called on first sight, after our own reload, and
@@ -2636,26 +2853,46 @@
 	// still has a path, and skipping it is how the dot silently never lights up.
 	function noteDiskBaseline(file) {
 		if (file == null || file.path == null) return;
-		var text = null;
-		try { text = file.readContent(); } catch (e) { delete DISK_BASE[file.path]; return; }
+		var text = diskTextOf(file);
 		if (typeof text !== "string") { delete DISK_BASE[file.path]; return; }
-		DISK_BASE[file.path] = { mtime: mtimeOf(file.path), sig: sigOf(text), prevSig: null, prevMtime: 0 };
+		DISK_BASE[file.path] = {
+			mtime: diskStamp(file),
+			sig: sigOf(text),
+			prevSig: null,
+			prevMtime: 0,
+			subs: subPathsOf(file).length
+		};
 	}
 
 	function fileChangedOnDisk(file) {
 		if (file == null || file.path == null) return false;
 		var path = file.path;
-		var mtime = mtimeOf(path);
-		if (!(mtime > 0)) return false;
+		var stamp = diskStamp(file);
+		if (!(stamp > 0)) return false;
 		var base = DISK_BASE[path];
 		if (base == null) { noteDiskBaseline(file); return false; }   // first sight: remember it
-		if (base.mtime === mtime) return false;           // untouched since the last look
-		var text = null;
-		try { text = file.readContent(); } catch (e) { return false; }
+		var nSubs = subPathsOf(file).length;
+		// A GMS2 object whose event list we could not obtain would silently fall back to
+		// "watch the .yy only" - the exact shape of the bug this fixes. Say so once per
+		// path instead of leaving it to be rediscovered. Sprites/fonts are `.yy` too and
+		// legitimately have no sub-files, hence the kind check.
+		if (nSubs === 0 && !MULTI_WARNED[path] && looksLikeEventKind(file)) {
+			MULTI_WARNED[path] = true;
+			log("change detection: no event file listed for " + path +
+				" - only the .yy itself is watched (extraFiles empty, folder listing failed)");
+		}
+		// The first pass can run before GMEdit has built `extraFiles` (that happens in
+		// `loadCode`). Learning that a file has sub-files is us seeing more, not the file
+		// changing - without this the dot would light up once, by itself, right after open.
+		// Any *other* change of that count is a real edit and falls through to the hash.
+		if (base.subs === 0 && nSubs > 0) { noteDiskBaseline(file); return false; }
+		if (base.mtime === stamp) return false;           // untouched since the last look
+		var text = diskTextOf(file);
 		if (typeof text !== "string") return false;
 		var sig = sigOf(text);
 		if (sig === base.sig) {                           // touched, but the bytes are the same
-			base.mtime = mtime;
+			base.mtime = stamp;
+			base.subs = nSubs;
 			return false;
 		}
 		// Real change. Remember what the buffer *should* still hold: that is how a stale
@@ -2666,8 +2903,14 @@
 
 	// The buffer is the previous on-disk version (the "Keep current" case): replacing it is
 	// not throwing away typing, so it must not be treated as dirty.
+	//
+	// Only true for single-file tabs. On a multi-file one `prevSig` hashes the .yy *plus*
+	// the event files, while `session.getValue()` is the assembled "#event" text, so the
+	// two can never match - and the conservative answer (treat it as dirty, leave it alone)
+	// is the right one there anyway.
 	function bufferIsOldDisk(file, session) {
 		if (file == null || file.path == null || session == null) return false;
+		if (subPathsOf(file).length > 0) return false;
 		var base = DISK_BASE[file.path];
 		if (base == null || base.prevSig == null) return false;
 		try { return sigOf(session.getValue()) === base.prevSig; } catch (e) { return false; }
@@ -2834,6 +3077,13 @@
 				row.hasCodeEditor = f.codeEditor != null;
 				row.hasSession = f.codeEditor != null && f.codeEditor.session != null;
 				row.mtime = mtimeOf(f.path);
+				// Multi-file tabs (GMS2 objects, script groups) are built from the .yy plus
+				// every event .gml, so the single-file numbers above are not what decides.
+				var subs = subPathsOf(f);
+				row.subFiles = subs.length;
+				row.isYy = /\.yy$/i.test(f.path);
+				row.isEventKind = looksLikeEventKind(f);
+				row.stamp = diskStamp(f);
 				var b = f.path != null ? DISK_BASE[f.path] : null;
 				row.baseMtime = b != null ? b.mtime : null;
 				row.baseSig = b != null ? b.sig : null;
@@ -2841,9 +3091,10 @@
 				try {
 					row.bufferSig = row.hasSession ? sigOf(f.codeEditor.session.getValue()) : null;
 				} catch (e2) { row.bufferSig = "err:" + errText(e2); }
-				var text = null;
-				try { text = f.readContent(); } catch (e3) { row.readError = errText(e3); }
+				// Same source the baseline uses, otherwise the two are not comparable.
+				var text = diskTextOf(f);
 				if (typeof text === "string") row.diskSig = sigOf(text);
+				else row.readError = "diskTextOf returned " + typeof text;
 				row.changed = fileChangedOnDisk(f);
 			} catch (e4) { row.error = errText(e4); }
 			out.files.push(row);
@@ -3129,6 +3380,7 @@
 		RELOAD_COUNT = -1;
 		unhookDiskSignals();
 		DISK_BASE = Object.create(null);
+		MULTI_WARNED = Object.create(null);
 		DISK_STAT_FAIL = 0;
 		DISK_STAT_WARNED = false;
 		try {
